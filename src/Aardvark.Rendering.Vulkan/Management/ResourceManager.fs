@@ -1307,12 +1307,16 @@ type ResourceSet() =
 
     member x.AddAndEvaluate(r : IResourceLocation<'a>) =
         x.EvaluateAlways AdaptiveToken.Top (fun t ->
-            all.Add r |> ignore
+            if all.Add r then
+                r.Acquire()
+
             r.Update t
         )
     member x.AddAndUpdate(r : IResourceLocation) =
         x.EvaluateAlways AdaptiveToken.Top (fun t ->
-            all.Add r |> ignore
+            if all.Add r then
+                r.Acquire()
+
             r.Update t |> ignore
         )   
 

@@ -31,6 +31,7 @@ module RenderCommands =
         | Empty
         | Leaf of 'a
         | Node of Option<'a> * list<Tree<'a>> 
+
      
     type ClearValues =
         {
@@ -102,6 +103,80 @@ module RenderCommands =
             pgCall          : INativeResourceLocation<DrawCall>
             pgResources     : list<IResourceLocation>
         }
+
+    type NoCache private() =
+        static let instance = NoCache() :> IResourceCache
+
+        static member Instance = instance
+
+        interface IResourceUser with
+            member x.AddLocked _ = ()
+            member x.RemoveLocked _ = ()
+        interface IResourceCache with
+            member x.Remove _ = ()
+
+    type PreparedFragment(resources : list<IResourceLocation>, compile : VKVM.CommandStream -> unit) =
+        inherit AbstractResourceLocation<VKVM.CommandStream>(NoCache.Instance, [])
+
+        let mutable isCreated = false
+
+        let mutable stream = Unchecked.defaultof<VKVM.CommandStream>
+        let mutable prev : Option<PreparedFragment> = None
+        let mutable next : Option<PreparedFragment> = None
+        let mutable tag : obj = null
+
+        member x.Resources = resources
+
+        member x.Tag
+            with get() : obj = tag
+            and set (t : obj) = tag <- t
+
+        member x.Prev
+            with get() = prev
+            and set (p : Option<PreparedFragment>) = 
+                prev <- p
+
+        member x.Next
+            with get() = next
+            and set (n : Option<PreparedFragment>) = 
+                next <- n
+                match n with
+                    | Some n -> stream.Next <- Some n.Stream
+                    | None -> stream.Next <- None
+
+        override x.Create() =
+            stream <- new VKVM.CommandStream()
+            compile stream
+            isCreated <- true
+
+        override x.Destroy() =
+            stream.Dispose()
+            stream <- Unchecked.defaultof<VKVM.CommandStream>
+            isCreated <- false
+
+        override x.GetHandle(t) =
+            { handle = stream; version = 0 }
+
+        member x.Stream : VKVM.CommandStream = stream
+
+        interface ILinked<PreparedFragment> with
+            member x.Prev
+                with get() = x.Prev
+                and set p = x.Prev <- p
+
+            member x.Next
+                with get() = x.Next
+                and set n = x.Next <- n
+
+    let private noStats =
+        let stats = NativePtr.alloc 1
+        NativePtr.write stats V2i.Zero
+        stats
+
+    let private alwaysActive =
+        let active = NativePtr.alloc 1
+        NativePtr.write active 1
+        active
 
     type ResourceManager with
         member x.PreparePipelineState (renderPass : RenderPass, state : PipelineState) =
@@ -203,6 +278,422 @@ module RenderCommands =
                 pgResources     = CSharpList.toList resources
             }
 
+        member x.PrepareFragment(state : PreparedPipelineState, g : Geometry) : PreparedFragment =
+            let pg = x.PrepareGeometry(state, g)
+
+            let compile (stream : VKVM.CommandStream) =
+                stream.IndirectBindDescriptorSets(pg.pgDescriptors.Pointer) |> ignore
+                stream.IndirectBindVertexBuffers(pg.pgAttributes.Pointer) |> ignore
+                match pg.pgIndex with
+                    | Some ibb -> stream.IndirectBindIndexBuffer(ibb.Pointer) |> ignore
+                    | None -> ()
+                stream.IndirectDraw(noStats, alwaysActive, pg.pgCall.Pointer) |> ignore
+
+            let f = PreparedFragment(pg.pgResources, compile)
+            f.Tag <- g
+            f
+
+    [<AllowNullLiteral>]
+    type MNode<'a, 'b when 'b :> ILinked<'b>> =
+        class
+            val mutable public Parent : MTree<'a, 'b>
+            val mutable public Value : Option<'b>
+            val mutable public Children : MNode<'a, 'b>[]
+
+            val mutable public First : 'b
+            val mutable public Last : 'b
+
+            new(p : MTree<'a, 'b>, v : 'b) = 
+                { Parent = p; Value = Some v; Children = [||]; First = v; Last = v }
+
+            new(p : MTree<'a, 'b>, v : Option<'b>, c : MNode<'a, 'b>[], first : 'b, last : 'b) = 
+                { Parent = p; Value = v; Children = c; First = first; Last = last }
+        end
+
+
+    and MTree<'a, 'b when 'b :> ILinked<'b>>(invoke : 'a -> 'b, revoke : 'b -> unit, identical : 'b -> 'a -> bool) =
+
+        let mutable first : Option<'b> = None
+        let mutable last : Option<'b> = None
+        let mutable root : MNode<'a, 'b> = null
+
+        let rec create (x : MTree<'a, 'b>) (t : Tree<'a>) =
+            match t with
+                | Tree.Empty -> 
+                    null
+                | Tree.Leaf v ->
+                    MNode(x, invoke v)
+                | Tree.Node(s,c) ->
+                    let c = List.toArray c
+
+                    let s = s |> Option.map invoke
+
+                    let mutable first = s
+                    let mutable last = s
+                    let mc = Array.zeroCreate c.Length
+                    for i in 0 .. c.Length - 1 do
+                        let ci = create x c.[i]
+                        match ci with
+                            | null -> ()
+                            | ci ->
+                                match last with
+                                    | Some l -> 
+                                        l.Next <- Some ci.First
+                                        last <- Some ci.Last
+                                    | None ->
+                                        first <- Some ci.First
+                                        last <- Some ci.Last
+                        mc.[i] <- ci
+
+                    MNode(x, s, mc, first.Value, last.Value)
+
+        let rec destroy (m : MNode<'a, 'b>) =
+            match m with
+                | null -> ()
+                | _ ->
+                    m.Value |> Option.iter revoke
+                    m.Children |> Array.iter destroy
+
+        let getFirst (m : MNode<'a, 'b>) =
+            match m with
+                | null -> None
+                | n -> Some n.First
+
+        let getLast (m : MNode<'a, 'b>) =
+            match m with
+                | null -> None
+                | n -> Some n.Last
+
+        let replace (o : 'b) (n : 'b) =
+            let prev = o.Prev
+            let next = o.Next
+            match prev with
+                | Some pp -> pp.Next <- Some n
+                | None -> first <- Some n
+
+            match next with
+                | Some nn -> nn.Prev <- Some n
+                | None -> last <- Some n
+
+        let insert (p : Option<'b>) (v : 'b) (n : Option<'b>) =
+            match p with
+                | Some p -> assert(Unchecked.equals p.Next n); p.Next <- Some v
+                | None -> first <- Some v
+
+            match n with
+                | Some n -> n.Prev <- Some v
+                | None -> last <- Some v
+        
+        let remove (b : 'b) =
+            let p = b.Prev
+            let n = b.Next
+
+            match p with
+                | Some p -> p.Next <- n
+                | None -> first <- n
+
+            match n with
+                | Some n -> n.Prev <- p
+                | None -> last <- p
+
+        member private x.Destroy(t : MNode<'a, 'b>) =
+            match t with
+                | null -> 
+                    ()
+                | _ ->
+                    let p = t.First.Prev
+                    let n = t.Last.Next
+
+                    destroy t
+
+                    match p with
+                        | Some p -> p.Next <- n
+                        | None -> first <- n
+
+                    match n with
+                        | Some n -> n.Prev <- p
+                        | None -> last <- p
+
+        member private x.Update(this : byref<MNode<'a, 'b>>, prev : Option<'b>, t : Tree<'a>, next : Option<'b>) =  
+            match this, t with
+                | null, Tree.Empty ->
+                    ()
+
+                | null, t -> 
+                    let m = create x t
+
+                    match prev with
+                        | Some p -> p.Next <- Some m.First
+                        | None -> first <- Some m.First
+
+                    match next with
+                        | Some n -> n.Prev <- Some m.Last
+                        | None -> last <- Some m.Last
+
+                    this <- m
+
+
+                | o, Tree.Empty ->
+                    x.Destroy o
+                    this <- null
+                
+                | o, Tree.Leaf a ->
+                    if o.Children.Length > 0 then
+                        let fc = o.Children.[0].First
+                        let lc = o.Children.[o.Children.Length - 1].Last
+                        o.Children |> Array.iter destroy
+                        o.Children <- [||]
+
+                        let p = fc.Prev
+                        let n = lc.Next
+                        match p with
+                            | Some p -> p.Next <- n
+                            | None -> first <- n 
+
+                        match n with
+                            | Some n -> n.Prev <- p
+                            | None -> last <- p 
+
+                    match o.Value with
+                        | Some b -> 
+                            if not (identical b a) then
+                                let n = invoke a
+                                replace b n
+                                revoke b
+                                o.Value <- Some n
+                        | None ->
+                            let b = invoke a
+                            insert prev b next
+                            o.Value <- Some b
+
+
+                | o, Tree.Node(s,c) ->
+                    let mutable prev = prev
+
+                    match s with    
+                        | Some a -> 
+                            match o.Value with
+                                | Some b -> 
+                                    if not (identical b a) then
+                                        let n = invoke a
+                                        replace b n
+                                        revoke b
+                                        o.Value <- Some n
+                                        prev <- Some n
+                                    else
+                                        prev <- Some b
+                                | None ->
+                                    let b = invoke a
+                                    insert prev b next
+                                    o.Value <- Some b
+                                    prev <- Some b
+                        | None ->
+                            match o.Value with
+                                | Some b -> 
+                                    remove b
+                                    revoke b
+                                    o.Value <- None
+                                | None -> 
+                                    ()
+
+                    let c = List.toArray c
+
+                    if o.Children.Length < c.Length then
+                        Array.Resize(&o.Children, c.Length)
+
+                    elif o.Children.Length > c.Length then
+                        for i in c.Length .. o.Children.Length - 1 do
+                            x.Destroy(o.Children.[i])
+                        Array.Resize(&o.Children, c.Length)
+
+                    for i in 0 .. c.Length - 1 do
+                        let n = 
+                            if i < c.Length - 1 then getFirst o.Children.[i+1]
+                            else next
+
+                        x.Update(&o.Children.[i], prev, c.[i], n)
+
+                        match getLast o.Children.[i] with
+                            | Some l -> prev <- Some l
+                            | None -> ()
+
+        member x.First = first
+        member x.Last = last
+
+        member x.Update(t : Tree<'a>) =
+            x.Update(&root, None, t, None)
+
+//
+//    type MTreeEntry =
+//        {
+//            preparedGeometry : PreparedGeometry
+//            stream : VKVM.CommandStream
+//        }
+//
+//    [<AllowNullLiteral>]
+//    type GeometryNode(parent : GeometryTree) =
+//        let mutable children : array<GeometryNode> = [||]
+//        let mutable value : Option<MTreeEntry> = None
+//
+//        let mutable prev : GeometryNode = null
+//        let mutable next : GeometryNode = null
+//        let mutable original : Tree<Geometry> = Tree.Empty
+//
+//        member x.Prev
+//            with get() = prev
+//            and set p = prev <- p
+//
+//        member x.Next
+//            with get() = next
+//            and set n = next <- n
+//
+//        member x.Children
+//            with get() = children
+//            and set c = children <- c
+//
+//        [<CompilationRepresentation(CompilationRepresentationFlags.Static)>]
+//        member x.First =
+//            match x with
+//                | null -> None
+//                | _ ->
+//                    match value with    
+//                        | Some v -> Some v.stream
+//                        | None -> 
+//                            if children.Length = 0 then None
+//                            else children.[0].First
+//                    
+//        [<CompilationRepresentation(CompilationRepresentationFlags.Static)>]
+//        member x.Last =
+//            match x with
+//                | null -> None
+//                | _ ->
+//                    if children.Length = 0 then
+//                        match value with    
+//                            | Some v -> Some v.stream
+//                            | None -> None
+//                    else
+//                        children.[children.Length - 1].Last
+//
+//        member x.Value
+//            with get() = value
+//            and set (v : Option<MTreeEntry>) =
+//                match value, v with
+//                    | None, Some v -> 
+//                        let prev =
+//                            match prev.Last with
+//                                | Some p -> Some p
+//                                | None ->
+//                                    match parent.First with
+//                                        | Some p -> Some p
+//                                        | None -> None
+//
+//                        match prev with
+//                            | Some p ->
+//                                let pn = p.Next
+//                                v.stream.Next <- pn
+//                                p.Next <- Some v.stream
+//                            | None ->
+//                                parent.First <- Some v.stream
+//                    | Some v, None ->
+//                        let p = v.stream.Prev
+//                        let n = v.stream.Next
+//                        match p with
+//                            | Some p -> p.Next <- n
+//                            | None -> parent.First <- n
+//
+//                    | Some oe, Some ne ->
+//                        if not (System.Object.ReferenceEquals(oe,ne)) then
+//                            let p = oe.stream.Prev
+//                            let n = oe.stream.Next
+//
+//                            ne.stream.Next <- n
+//                            match p with
+//                                | Some p -> p.Next <- Some ne.stream
+//                                | None -> parent.First <- Some ne.stream
+//
+//                        ()
+//                        
+//                    | None, None ->
+//                        ()
+//
+//
+//
+//    and GeometryTree() =
+//        let mutable first : Option<VKVM.CommandStream> = None
+//        let mutable last : Option<VKVM.CommandStream> = None
+//
+//        member x.First
+//            with get() = first
+//            and set f = first <- f
+//
+//        member x.Last
+//            with get() = last
+//            and set l = last <- l
+//
+//    and [<RequireQualifiedAccess>] GeometryRef =
+//        | Empty
+//        | Value of VKVM.CommandStream
+//        | Node of GeometryNode
+//
+//        member x.First =
+//            match x with
+//                | GeometryRef.Empty | GeometryRef.Node null -> None
+//                | GeometryRef.Value v -> Some v
+//                | GeometryRef.Node t -> 
+//                    match t.Value with
+//                        | Some v -> Some v.stream
+//                        | None ->
+//                            if t.Children.Length = 0 then
+//                                (GeometryRef.Node t.Next).First
+//                            else
+//                                t.Children.[0].First
+//
+//        member x.Last =
+//            match x with
+//                | GeometryRef.Empty | GeometryRef.Node null -> None
+//                | GeometryRef.Value v -> Some v
+//                | GeometryRef.Node t ->
+//                    if t.Children.Length = 0 then
+//                        match t.Value with
+//                            | Some v -> Some v.stream
+//                            | None -> (GeometryRef.Node t.Prev).Last
+//                    else
+//                        t.Children.[t.Children.Length - 1].Last
+//
+//    [<AllowNullLiteral>]
+//    type MTree =
+//        class
+//            val mutable public Children : list<ref<MTree>>
+//            val mutable public Value : Option<MTreeEntry>
+//
+//            new(value) = { Value = Some value; Children = [] }
+//            new(value, children) = { Value = value; Children = children }
+//        end
+//
+//    type MTree with
+//        member x.IsEmpty =
+//            match x with
+//                | null -> true
+//                | _ -> false
+//
+//        member x.IsNode =
+//            if isNull x then 
+//                false
+//            else
+//                match x.Children with
+//                    | [] -> false
+//                    | _ -> true
+//        
+//    let inline (|MEmpty|MLeaf|MNode|) (t : MTree) =
+//        match t with
+//            | null -> MEmpty
+//            | _ ->
+//                match t.Children with
+//                    | [] -> MLeaf t.Value.Value
+//                    | c -> MNode(t.Value, t.Children)
+//
+
+
     type TreeCommandStreamResource(owner, key, pipe : PipelineState, things : IMod<Tree<Geometry>>, resources : ResourceSet, manager : ResourceManager, renderPass : RenderPass, stats : nativeptr<V2i>) =
         inherit AbstractResourceLocation<VKVM.CommandStream>(owner, key)
          
@@ -214,7 +705,6 @@ module RenderCommands =
 
         let bounds = lazy (Mod.constant Box3d.Invalid)
         let allResources = ReferenceCountingSet<IResourceLocation>()
-        let mutable state = Tree.Empty
 
         let isActive =
             let isActive = NativePtr.alloc 1
@@ -222,122 +712,27 @@ module RenderCommands =
             isActive
 
         let prepare (g : Geometry) =
-            let res = manager.PrepareGeometry(preparedPipeline, g)
-            for r in res.pgResources do 
+            let p = manager.PrepareFragment(preparedPipeline, g)
+            for r in p.Resources do 
                 if allResources.Add r then 
                     resources.AddAndUpdate r
-                    r.Update(AdaptiveToken.Top) |> ignore
+            p.Acquire()
+            p
 
-            let stream = new VKVM.CommandStream()
-            stream.IndirectBindDescriptorSets(res.pgDescriptors.Pointer) |> ignore
-            stream.IndirectBindVertexBuffers(res.pgAttributes.Pointer) |> ignore
-            match res.pgIndex with
-                | Some ibb -> stream.IndirectBindIndexBuffer(ibb.Pointer) |> ignore
-                | None -> ()
-            stream.IndirectDraw(stats, isActive, res.pgCall.Pointer) |> ignore
-
-
-            res, stream
-
-        let release (pg : PreparedGeometry, stream : VKVM.CommandStream) =
-            for r in pg.pgResources do
+        let release (e : PreparedFragment) =
+            e.Release()
+            for r in e.Resources do
                 if allResources.Remove r then 
                     resources.Remove r
-            stream.Dispose()
 
-        let isIdentical (pg : PreparedGeometry, stream : VKVM.CommandStream) (o : Geometry) =
-            System.Object.ReferenceEquals(pg.pgOriginal, o)
+        let isIdentical (e : PreparedFragment) (o : Geometry) =
+            System.Object.ReferenceEquals(e.Tag, o)
 
-        let update (t : Tree<Geometry>) =
-            
-            let rec destroy (t : Tree<_>) =
-                match t with
-                    | Tree.Empty -> ()
-                    | Tree.Leaf v -> release v
-                    | Tree.Node(s,c) ->
-                        s |> Option.iter release
-                        c |> List.iter destroy
+        let state = MTree<Geometry, PreparedFragment>(prepare, release, isIdentical)
 
-            let rec update (o : Tree<_>) (n : Tree<Geometry>) =
-                match o, n with
-                    
-                    | _, Tree.Empty ->
-                        destroy o
-                        Tree.Empty
-
-                    | Tree.Empty, Tree.Leaf g -> Tree.Leaf (prepare g)
-                    | Tree.Empty, Tree.Node(self, children) ->
-                        let self =
-                            match self with
-                                | Some self -> Some (prepare self)
-                                | None -> None
-                        let children = children |> List.map (update Tree.Empty)
-                        Tree.Node(self, children)
-
-
-                    | Tree.Leaf o, Tree.Leaf n -> 
-                        if isIdentical o n then 
-                            Tree.Leaf o
-                        else
-                            release o
-                            Tree.Leaf(prepare n)
-
-                    | Tree.Leaf o, Tree.Node(ns,nc) ->
-                        let self = 
-                            match ns with
-                                | Some ns ->
-                                    if isIdentical o ns then 
-                                        Some o
-                                    else
-                                        release o
-                                        Some (prepare ns)
-                                | None ->
-                                    None
-                        let children = nc |> List.map (update Tree.Empty)
-                        Tree.Node(self, children)
-
-                    | Tree.Node(os, oc), Tree.Leaf(n) ->
-                        oc |> List.iter destroy
-                        let self = 
-                            match os with
-                                | None -> prepare n
-                                | Some os ->
-                                    if isIdentical os n then os
-                                    else
-                                        release os
-                                        prepare n
-                        Tree.Leaf self
-                    | Tree.Node(os, oc), Tree.Node(ns, nc) ->
-                        let self = 
-                            match os, ns with
-                                | None, Some ns -> Some (prepare ns)
-                                | Some os, None -> release os; None
-                                | None, None -> None
-                                | Some os, Some ns ->
-                                    if isIdentical os ns then 
-                                        Some os
-                                    else
-                                        release os
-                                        Some (prepare ns)
-                        let children = List.map2 update oc nc
-                        Tree.Node(self, children)
-            
-            state <- update state t
-
-            let rec link (last : VKVM.CommandStream) (t : Tree<PreparedGeometry * VKVM.CommandStream>) =
-                match t with
-                    | Tree.Empty -> last
-                    | Tree.Leaf(_,v) -> 
-                        last.Next <- Some v
-                        v
-                    | Tree.Node(Some(_,s), children) ->
-                        last.Next <- Some s
-                        children |> List.fold link s
-                    | Tree.Node(None, children) ->
-                        children |> List.fold link last
-                        
-            let final = link entry state
-            final.Next <- None
+        let performUpdate (t : Tree<Geometry>) =
+            state.Update(t)
+            entry.Next <- state.First |> Option.map (fun f -> f.Stream)
 
         member x.Stream = stream
         member x.GroupKey = [preparedPipeline.ppPipeline :> obj; id :> obj]
@@ -350,11 +745,12 @@ module RenderCommands =
             member x.BoundingBox = x.BoundingBox
 
         override x.Create() =
+            if allResources.Add preparedPipeline.ppPipeline then resources.Add preparedPipeline.ppPipeline
+
             stream <- new VKVM.CommandStream()
             entry <- new VKVM.CommandStream()
             stream.Call(entry) |> ignore
-
-            if allResources.Add preparedPipeline.ppPipeline then resources.Add preparedPipeline.ppPipeline
+            entry.IndirectBindPipeline preparedPipeline.ppPipeline.Pointer |> ignore
             
         override x.Destroy() = 
             stream.Dispose()
@@ -364,7 +760,7 @@ module RenderCommands =
             
         override x.GetHandle token =
             let tree = things.GetValue token
-            update tree
+            performUpdate tree
             { handle = stream; version = 0 }   
 
 

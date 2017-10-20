@@ -1283,11 +1283,14 @@ open Aardvark.Application.WinForms
 let main args =
     //Management.run()
 
-    let useVulkan = true
 
     Ag.initialize()
     Aardvark.Init()
 
+    NewRenderObjectStuff.run()
+    Environment.Exit 0
+
+    let useVulkan = true
     //colorLockTest()
     let app,win =
         if useVulkan then
